@@ -35,7 +35,6 @@ const PROMPTS_ONLY_NULL_KEYS: [&str; 1] = ["response"];
 pub trait Host: Send + Sync {
     fn callback_failed(&self);
     fn batch_upload_failed(&self, queued: usize, failed: usize, total: usize);
-    fn region_from_environment(&self) -> Result<Option<String>, String>;
     fn web_identity_token(&self, reference: &str) -> Result<String, String>;
 }
 
@@ -48,6 +47,7 @@ pub struct S3LogParts {
     pub backoff: Backoff,
     pub host: Arc<dyn Host>,
     pub cold_storage_is_s3_v2: bool,
+    pub region_from_environment: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -148,7 +148,7 @@ impl S3Log {
                 settings,
                 client: parts.client,
                 download_client: parts.download_client,
-                host: Arc::clone(&parts.host),
+                environment_region: parts.region_from_environment,
                 auth: AwsAuthService::for_web_identity(
                     Arc::new(move |reference: &str| resolver_host.web_identity_token(reference)),
                     session_policy,

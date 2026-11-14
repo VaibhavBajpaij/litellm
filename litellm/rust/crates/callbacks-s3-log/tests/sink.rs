@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -25,8 +25,6 @@ struct Recorder {
     failures: AtomicUsize,
     next: AtomicU64,
     payloads: Mutex<HashMap<u64, Option<String>>>,
-    region: Mutex<Option<Result<Option<String>, String>>>,
-    region_panics: AtomicBool,
     batch_failures: Mutex<Vec<(usize, usize, usize)>>,
 }
 
@@ -102,14 +100,6 @@ impl Host for Recorder {
             .push((queued, failed, total));
     }
 
-    fn region_from_environment(&self) -> Result<Option<String>, String> {
-        assert!(
-            !self.region_panics.load(Ordering::Relaxed),
-            "the host panicked"
-        );
-        self.region.lock().unwrap().clone().unwrap_or(Ok(None))
-    }
-
     fn web_identity_token(&self, reference: &str) -> Result<String, String> {
         Ok(reference.to_owned())
     }
@@ -132,7 +122,7 @@ fn sink_with(
     extra: Value,
     constants: Constants,
 ) -> (Arc<S3Log>, Arc<Recorder>) {
-    sink_from(server, extra, constants, false)
+    sink_from(server, extra, constants, false, None)
 }
 
 fn sink_from(
@@ -140,6 +130,7 @@ fn sink_from(
     extra: Value,
     constants: Constants,
     cold_storage_is_s3_v2: bool,
+    region_from_environment: Option<&str>,
 ) -> (Arc<S3Log>, Arc<Recorder>) {
     let mut params = json!({
         "s3_bucket_name": "logs",
@@ -167,6 +158,7 @@ fn sink_from(
         backoff: Arc::new(|_| Duration::ZERO),
         host: Arc::clone(&host) as Arc<dyn Host>,
         cold_storage_is_s3_v2,
+        region_from_environment: region_from_environment.map(str::to_owned),
     });
     (sink, host)
 }
@@ -433,13 +425,12 @@ async fn a_body_that_cannot_be_encoded_stays_queued_and_counts_a_failure() {
 }
 
 #[rstest]
-#[case::environment(Ok(Some("ap-south-1".to_owned())), Some("/ap-south-1/"))]
-#[case::default(Ok(None), Some("/us-west-2/"))]
-#[case::invalid(Ok(Some("Ap_South".to_owned())), None)]
-#[case::secret_failure(Err("secret manager down".to_owned()), None)]
+#[case::environment(Some("ap-south-1"), Some("/ap-south-1/"))]
+#[case::default(None, Some("/us-west-2/"))]
+#[case::invalid(Some("Ap_South"), None)]
 #[tokio::test]
-async fn without_a_region_param_the_host_resolves_the_signing_region(
-    #[case] region: Result<Option<String>, String>,
+async fn without_a_region_param_the_constructor_region_signs(
+    #[case] region: Option<&str>,
     #[case] scope: Option<&str>,
 ) {
     let server = MockServer::start().await;
@@ -447,11 +438,13 @@ async fn without_a_region_param_the_host_resolves_the_signing_region(
         .respond_with(ResponseTemplate::new(200))
         .mount(&server)
         .await;
-    let (sink, host) = sink(
+    let (sink, host) = sink_from(
         &server,
         json!({"s3_region_name": null, "s3_aws_session_token": "session"}),
+        Constants::default(),
+        false,
+        region,
     );
-    *host.region.lock().unwrap() = Some(region);
     submit(&sink, event(&host, "a", "{}")).await;
     sink.flush().await;
 
@@ -548,32 +541,6 @@ async fn a_panic_while_rendering_a_batch_file_keeps_the_whole_queue() {
 }
 
 #[rstest]
-#[tokio::test]
-async fn a_panic_in_a_host_call_keeps_the_object_and_later_flushes_deliver_it() {
-    let server = MockServer::start().await;
-    Mock::given(method("PUT"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&server)
-        .await;
-    let (sink, host) = sink(
-        &server,
-        json!({"s3_region_name": null, "s3_aws_session_token": "session"}),
-    );
-    host.region_panics.store(true, Ordering::Relaxed);
-    submit(&sink, event(&host, "a", "{}")).await;
-    sink.flush().await;
-
-    assert!(server.received_requests().await.unwrap().is_empty());
-    assert_eq!(sink.queued_keys().len(), 1);
-    assert_eq!(host.failures(), 1);
-
-    host.region_panics.store(false, Ordering::Relaxed);
-    sink.flush().await;
-    assert!(sink.queued_keys().is_empty());
-    assert_eq!(server.received_requests().await.unwrap().len(), 1);
-}
-
-#[rstest]
 #[case::bool_alias(json!({"metadata_kind": "mapping", "team_alias": true}))]
 #[case::int_alias(json!({"metadata_kind": "mapping", "team_alias": 7}))]
 #[case::nan_alias(serde_json::to_value(LoggedKeyIdentity {
@@ -640,6 +607,32 @@ async fn prompts_only_renders_the_response_as_null(#[case] extra: Value, #[case]
     );
 }
 
+#[rstest]
+#[tokio::test]
+async fn a_region_param_wins_over_the_constructor_region() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let (sink, host) = sink_from(
+        &server,
+        json!({}),
+        Constants::default(),
+        false,
+        Some("ap-south-1"),
+    );
+    submit(&sink, event(&host, "a", "{}")).await;
+    sink.flush().await;
+
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        header(&requests[0], "authorization")
+            .unwrap()
+            .contains("/us-east-1/")
+    );
+}
+
 const HOUR_KEY: &str = "base/2026-11-13/09/time-09-05-07-000042_a.json";
 const DAY_KEY: &str = "base/2026-11-13/time-09-05-07-000042_a.json";
 
@@ -660,6 +653,7 @@ async fn the_constructor_cold_storage_owner_decides_the_cold_key(
         json!({}),
         Constants::default(),
         cold_storage_is_s3_v2,
+        None,
     );
     let mut cold = event(&host, "a", "{}");
     cold.identity = identity;
@@ -688,6 +682,7 @@ async fn the_constructor_cold_storage_owner_turns_batch_files_off(
         json!({"s3_batch_file_upload": true}),
         Constants::default(),
         cold_storage_is_s3_v2,
+        None,
     );
     submit(&sink, event(&host, "a", "{}")).await;
     sink.flush().await;

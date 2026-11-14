@@ -63,12 +63,6 @@ impl Host for PythonHost {
         });
     }
 
-    fn region_from_environment(&self) -> Result<Option<String>, String> {
-        self.ask("region_from_environment", None, |answer| {
-            answer.extract::<Option<String>>()
-        })
-    }
-
     fn web_identity_token(&self, reference: &str) -> Result<String, String> {
         self.ask("web_identity_token", Some(reference), |answer| {
             answer.extract::<String>()
@@ -121,13 +115,14 @@ fn settings_params(params: &Bound<'_, PyDict>) -> Map<String, Value> {
 #[pymethods]
 impl NativeS3Log {
     #[new]
-    #[pyo3(signature = (params, constants, host, cold_storage_is_s3_v2))]
+    #[pyo3(signature = (params, constants, host, cold_storage_is_s3_v2, region_from_environment))]
     fn new(
         py: Python<'_>,
         params: &Bound<'_, PyDict>,
         constants: &Bound<'_, PyAny>,
         host: Py<PyAny>,
         cold_storage_is_s3_v2: bool,
+        region_from_environment: Option<String>,
     ) -> PyResult<Self> {
         let resolved = settings_params(params);
         let constants: Constants = from_py(constants)?;
@@ -143,6 +138,7 @@ impl NativeS3Log {
             backoff: Arc::new(python_backoff),
             host: host as Arc<dyn Host>,
             cold_storage_is_s3_v2,
+            region_from_environment,
         });
         Ok(Self { sink })
     }

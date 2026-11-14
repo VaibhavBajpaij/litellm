@@ -63,6 +63,12 @@ def _cold_storage_is_s3_v2() -> bool:
     return litellm.cold_storage_custom_logger == "s3_v2"
 
 
+def _region_from_environment() -> str | None:
+    region_name: Final = get_secret_str("AWS_REGION_NAME", None)
+    region: Final = get_secret_str("AWS_REGION", None)
+    return region if region is not None else region_name
+
+
 class _Host:
     def __init__(self) -> None:
         self.failures: Final = CustomLogger()
@@ -77,11 +83,6 @@ class _Host:
             verbose_logger.exception(
                 "CustomLogger: async_send_batch raised; preserving %s events in queue for retry", queued
             )
-
-    def region_from_environment(self) -> str | None:
-        region_name: Final = get_secret_str("AWS_REGION_NAME", None)
-        region: Final = get_secret_str("AWS_REGION", None)
-        return region if region is not None else region_name
 
     def web_identity_token(self, reference: str) -> str:
         if reference.startswith("os.environ/") or reference in os.environ:
@@ -331,6 +332,7 @@ class S3Logger(RustLogger):
             _constants(settings.get("s3_batch_size", DEFAULT_S3_BATCH_SIZE)),
             host,
             _cold_storage_is_s3_v2(),
+            None if params.get("s3_region_name") else _region_from_environment(),
         )
         self.s3_region_name: Final[object] = params.get("s3_region_name") or settings.get("s3_region_name")
         self.sink: Final = sink

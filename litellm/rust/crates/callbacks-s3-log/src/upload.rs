@@ -18,7 +18,6 @@ use crate::{
     key::{hex_sha256, object_url},
     limiter::Limiter,
     settings::{Environment, Settings},
-    sink::Host,
 };
 
 const ATTEMPTS: u32 = 3;
@@ -87,16 +86,6 @@ pub struct Object {
     pub body: Body,
     pub content_type: &'static str,
     pub download_name: String,
-}
-
-pub async fn on_host<T: Send + 'static>(
-    host: &Arc<dyn Host>,
-    call: impl FnOnce(&dyn Host) -> T + Send + 'static,
-) -> Result<T, String> {
-    let host = Arc::clone(host);
-    tokio::task::spawn_blocking(move || call(host.as_ref()))
-        .await
-        .map_err(|error| error.to_string())
 }
 
 pub fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
@@ -168,7 +157,7 @@ pub struct Uploader {
     pub settings: Arc<Settings>,
     pub client: litellm_http::Client,
     pub download_client: litellm_http::Client,
-    pub host: Arc<dyn Host>,
+    pub environment_region: Option<String>,
     pub auth: AwsAuthService,
     pub environment: Arc<Environment>,
     pub clock: Clock,
@@ -263,13 +252,9 @@ impl Uploader {
         body: &Bytes,
     ) -> Result<Attempt, String> {
         let credentials = self.credentials().await?;
-        let from_environment = match self.settings.region_name {
-            Some(_) => Ok(None),
-            None => on_host(&self.host, |host| host.region_from_environment())
-                .await
-                .and_then(|region| region),
-        };
-        let region = self.settings.signing_region(|| from_environment)?;
+        let region = self
+            .settings
+            .signing_region(|| Ok(self.environment_region.clone()))?;
         let put = || {
             send(
                 &self.client,

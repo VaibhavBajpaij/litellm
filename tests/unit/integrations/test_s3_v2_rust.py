@@ -1353,6 +1353,44 @@ async def test_the_cold_storage_owner_is_fixed_when_the_logger_is_built(
     assert put.path.endswith(suffix)
 
 
+@pytest.mark.parametrize(
+    ("environment", "region"),
+    [
+        ({"AWS_REGION": "ap-south-1"}, "ap-south-1"),
+        ({"AWS_REGION_NAME": "eu-central-1"}, "eu-central-1"),
+        ({"AWS_REGION": "ap-south-1", "AWS_REGION_NAME": "eu-central-1"}, "ap-south-1"),
+        ({}, "us-west-2"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_the_environment_region_is_read_when_the_logger_is_built(
+    monkeypatch: pytest.MonkeyPatch, bucket: ScriptedBucket, environment: Mapping[str, str], region: str
+) -> None:
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    logger: Final = _logger(monkeypatch, bucket, s3_region_name=None)
+    monkeypatch.setenv("AWS_REGION", "sa-east-1")
+    monkeypatch.setenv("AWS_REGION_NAME", "sa-east-1")
+
+    await _upload(logger, {"id": "req-1"})
+
+    (put,) = bucket.puts()
+    assert f"/{region}/s3/aws4_request" in put.headers["authorization"]
+
+
+@pytest.mark.asyncio
+async def test_a_region_param_is_not_replaced_by_the_environment_region(
+    monkeypatch: pytest.MonkeyPatch, bucket: ScriptedBucket
+) -> None:
+    monkeypatch.setenv("AWS_REGION", "ap-south-1")
+    logger: Final = _logger(monkeypatch, bucket)
+
+    await _upload(logger, {"id": "req-1"})
+
+    (put,) = bucket.puts()
+    assert "/us-east-1/s3/aws4_request" in put.headers["authorization"]
+
+
 def _coded_body(code: str | None, raw_body: str | None = None) -> str:
     return raw_body if raw_body is not None else (f"<Error><Code>{code}</Code></Error>" if code is not None else "")
 

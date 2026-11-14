@@ -59,6 +59,18 @@ def _raise_batch_upload_error(failed: int, total: int) -> None:
     raise S3BatchUploadError(failed=failed, total=total)
 
 
+def batch_upload_failed(failure: tuple[int, int, int] | None) -> None:
+    if failure is None:
+        return
+    queued, failed, total = failure
+    try:
+        _raise_batch_upload_error(failed, total)
+    except S3BatchUploadError:
+        verbose_logger.exception(
+            "CustomLogger: async_send_batch raised; preserving %s events in queue for retry", queued
+        )
+
+
 def _cold_storage_is_s3_v2() -> bool:
     return litellm.cold_storage_custom_logger == "s3_v2"
 
@@ -75,14 +87,6 @@ class _Host:
 
     def callback_failed(self) -> None:
         self.failures.handle_callback_failure(callback_name="S3Logger")
-
-    def batch_upload_failed(self, queued: int, failed: int, total: int) -> None:
-        try:
-            _raise_batch_upload_error(failed, total)
-        except S3BatchUploadError:
-            verbose_logger.exception(
-                "CustomLogger: async_send_batch raised; preserving %s events in queue for retry", queued
-            )
 
     def web_identity_token(self, reference: str) -> str:
         if reference.startswith("os.environ/") or reference in os.environ:
@@ -252,7 +256,7 @@ async def _periodic_flush(sink: "NativeS3Log", interval: float) -> None:
     while True:
         await asyncio.sleep(interval)
         try:
-            await sink.flush()
+            batch_upload_failed(await sink.flush())
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
         except BaseException as e:  # noqa: BLE001  # a failed flush keeps the queue and the next interval tries again, as flush_queue does
@@ -383,12 +387,12 @@ class S3Logger(RustLogger):
         return "hour" if self.sink.partition_granularity() == "hour" else "day"
 
     async def flush_queue(self) -> None:
-        await self.sink.flush()
+        batch_upload_failed(await self.sink.flush())
 
     async def async_log_audit_log_event(self, audit_log: StandardAuditLogPayload) -> None:
         try:
             audit_log_id: Final = audit_log.get("id", "unknown")
-            await self.sink.submit_audit(dict(audit_log), f"{audit_log_id}")
+            batch_upload_failed(await self.sink.submit_audit(dict(audit_log), f"{audit_log_id}"))
         except Exception as e:  # noqa: BLE001  # an audit log failure is logged and swallowed, as in S3Logger
             verbose_logger.exception("S3 audit log error: %s", e)
 

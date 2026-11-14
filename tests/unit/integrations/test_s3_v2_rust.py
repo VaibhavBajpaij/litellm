@@ -2951,3 +2951,48 @@ async def test_a_partially_failed_flush_logs_s3_batch_upload_error_like_main(
     assert (error.failed, error.total) == (1, 3)
     assert str(error) == "1 of 3 S3 uploads failed; transient failures kept in queue for the next flush"
     assert "S3BatchUploadError: 1 of 3 S3 uploads failed" in logging.Formatter().formatException(record.exc_info)
+
+
+@pytest.mark.asyncio
+async def test_the_native_flush_returns_a_partial_failure_and_logs_no_record_of_its_own(
+    monkeypatch: pytest.MonkeyPatch, bucket: ScriptedBucket
+) -> None:
+    from litellm._logging import verbose_logger
+
+    logger: Final = _logger(monkeypatch, bucket)
+    bucket.reply("_elem-1.json", _SLOW_DOWN)
+    await _log_all(logger, [_payload(f"elem-{i}") for i in range(3)])
+    records: Final = _Records()
+    verbose_logger.addHandler(records)
+    try:
+        failure: Final = await logger.sink.flush()
+    finally:
+        verbose_logger.removeHandler(records)
+
+    assert failure == (3, 1, 3)
+    assert [record for record in records.records if "async_send_batch raised" in record.getMessage()] == []
+    bucket.script.clear()
+    assert await logger.sink.flush() is None
+
+
+@pytest.mark.asyncio
+async def test_a_partially_failed_flush_from_an_audit_log_logs_s3_batch_upload_error(
+    monkeypatch: pytest.MonkeyPatch, bucket: ScriptedBucket
+) -> None:
+    from litellm._logging import verbose_logger
+    from litellm.integrations.s3_v2 import S3BatchUploadError
+
+    logger: Final = _constructed(monkeypatch, bucket, {"s3_batch_size": 2})
+    bucket.reply("_audit-1.json", _SLOW_DOWN)
+    records: Final = _Records()
+    verbose_logger.addHandler(records)
+    try:
+        for audit_id in ("audit-1", "audit-2"):
+            await logger.async_log_audit_log_event({"id": audit_id})
+    finally:
+        verbose_logger.removeHandler(records)
+
+    (record,) = [record for record in records.records if record.exc_info is not None]
+    assert record.getMessage() == "CustomLogger: async_send_batch raised; preserving 2 events in queue for retry"
+    assert record.exc_info is not None
+    assert isinstance(record.exc_info[1], S3BatchUploadError)

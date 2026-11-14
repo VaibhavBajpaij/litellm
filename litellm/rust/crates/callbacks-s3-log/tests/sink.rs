@@ -12,7 +12,7 @@ use litellm_callbacks::{
     Callback, Field, FieldSet, FieldValues, Hook, HookInput, LoggedKeyIdentity, MetadataKind,
     PayloadHost, PayloadRef, RenderOptions, Rendered, Scalar,
 };
-use litellm_callbacks_s3_log::{Constants, Host, S3Log, S3LogParts, Settings};
+use litellm_callbacks_s3_log::{BatchUploadFailure, Constants, Host, S3Log, S3LogParts, Settings};
 use rstest::rstest;
 use serde_json::{Value, json};
 use wiremock::{
@@ -25,7 +25,6 @@ struct Recorder {
     failures: AtomicUsize,
     next: AtomicU64,
     payloads: Mutex<HashMap<u64, Option<String>>>,
-    batch_failures: Mutex<Vec<(usize, usize, usize)>>,
 }
 
 const PANICS: &str = "panics while rendering";
@@ -91,13 +90,6 @@ impl PayloadHost for Recorder {
 impl Host for Recorder {
     fn callback_failed(&self) {
         self.failures.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn batch_upload_failed(&self, queued: usize, failed: usize, total: usize) {
-        self.batch_failures
-            .lock()
-            .unwrap()
-            .push((queued, failed, total));
     }
 
     fn web_identity_token(&self, reference: &str) -> Result<String, String> {
@@ -244,7 +236,7 @@ async fn a_flush_puts_one_object_per_event_with_the_python_headers() {
         event(&host, "chatcmpl-1", "{\"id\": \"chatcmpl-1\"}"),
     )
     .await;
-    sink.flush().await;
+    let failure = sink.flush().await;
 
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
@@ -281,7 +273,7 @@ async fn a_flush_puts_one_object_per_event_with_the_python_headers() {
     );
     assert!(sink.queued_keys().is_empty());
     assert_eq!(host.failures.load(Ordering::Relaxed), 0);
-    assert!(host.batch_failures.lock().unwrap().is_empty());
+    assert_eq!(failure, None);
 }
 
 #[rstest]
@@ -295,12 +287,19 @@ async fn a_bucket_that_fails_every_upload_keeps_the_queue() {
     let (sink, host) = sink(&server, json!({}));
     submit(&sink, event(&host, "a", "{}")).await;
     submit(&sink, event(&host, "b", "{}")).await;
-    sink.flush().await;
+    let failure = sink.flush().await;
 
     assert_eq!(server.received_requests().await.unwrap().len(), 6);
     assert_eq!(sink.queued_keys().len(), 2);
     assert_eq!(host.failures.load(Ordering::Relaxed), 2);
-    assert_eq!(*host.batch_failures.lock().unwrap(), vec![(2, 2, 2)]);
+    assert_eq!(
+        failure,
+        Some(BatchUploadFailure {
+            queued: 2,
+            failed: 2,
+            total: 2
+        })
+    );
 }
 
 #[rstest]

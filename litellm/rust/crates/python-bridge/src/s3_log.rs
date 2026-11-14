@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use litellm_callbacks::ErasedCallback;
 use litellm_callbacks_python::{RustCallback, payload};
 use litellm_callbacks_s3_log::{
-    Constants, Host, S3Log, S3LogParts, Settings, python_backoff, system_clock,
+    BatchUploadFailure, Constants, Host, S3Log, S3LogParts, Settings, python_backoff, system_clock,
 };
 use litellm_host_python::{from_py, json_from_py};
 use litellm_http::ClientVariant;
@@ -52,22 +52,17 @@ impl Host for PythonHost {
         }
     }
 
-    fn batch_upload_failed(&self, queued: usize, failed: usize, total: usize) {
-        Python::attach(|py| {
-            if let Err(error) =
-                self.host
-                    .call_method1(py, "batch_upload_failed", (queued, failed, total))
-            {
-                error.print(py);
-            }
-        });
-    }
-
     fn web_identity_token(&self, reference: &str) -> Result<String, String> {
         self.ask("web_identity_token", Some(reference), |answer| {
             answer.extract::<String>()
         })
     }
+}
+
+type Failure = Option<(usize, usize, usize)>;
+
+fn failure(failure: Option<BatchUploadFailure>) -> Failure {
+    failure.map(|failure| (failure.queued, failure.failed, failure.total))
 }
 
 #[pyclass(frozen, name = "NativeS3Log")]
@@ -188,8 +183,7 @@ impl NativeS3Log {
         crate::execution::run_async_value(
             py,
             payload::on_render_loop(event_loop, async move {
-                sink.submit_audit(stashed, &id).await;
-                Ok(())
+                Ok(failure(sink.submit_audit(stashed, &id).await))
             }),
         )
     }
@@ -222,10 +216,7 @@ impl NativeS3Log {
         let event_loop = payload::running_loop(py);
         crate::execution::run_async_value(
             py,
-            payload::on_render_loop(event_loop, async move {
-                sink.flush().await;
-                Ok(())
-            }),
+            payload::on_render_loop(event_loop, async move { Ok(failure(sink.flush().await)) }),
         )
     }
 }

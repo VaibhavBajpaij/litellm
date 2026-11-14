@@ -34,7 +34,6 @@ const PROMPTS_ONLY_NULL_KEYS: [&str; 1] = ["response"];
 
 pub trait Host: Send + Sync {
     fn callback_failed(&self);
-    fn batch_upload_failed(&self, queued: usize, failed: usize, total: usize);
     fn web_identity_token(&self, reference: &str) -> Result<String, String>;
 }
 
@@ -48,6 +47,13 @@ pub struct S3LogParts {
     pub host: Arc<dyn Host>,
     pub cold_storage_is_s3_v2: bool,
     pub region_from_environment: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BatchUploadFailure {
+    pub queued: usize,
+    pub failed: usize,
+    pub total: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -325,7 +331,7 @@ impl S3Log {
         self.host.callback_failed();
     }
 
-    pub async fn submit_audit(&self, payload: PayloadRef, id: &str) {
+    pub async fn submit_audit(&self, payload: PayloadRef, id: &str) -> Option<BatchUploadFailure> {
         let body = self.hold(Arc::new(payload), RenderOptions::default());
         let now = Stamp::utc((self.uploader.clock)());
         let key = object_key(
@@ -346,8 +352,9 @@ impl S3Log {
             is_file: false,
         });
         if queued >= self.settings().batch_size {
-            self.flush().await;
+            return self.flush().await;
         }
+        None
     }
 
     pub async fn upload_now(&self, key: String, body: String, download_name: String) -> bool {
@@ -372,30 +379,33 @@ impl S3Log {
         self.uploader.download(key).await
     }
 
-    pub async fn flush(&self) {
+    pub async fn flush(&self) -> Option<BatchUploadFailure> {
         let _flushing = self.flush_lock.lock().await;
         let (batch, requeued) = {
             let queue = self.queue();
             if queue.items.is_empty() {
-                return;
+                return None;
             }
             (queue.items.clone(), queue.requeued)
         };
         let length = batch.len();
-        match std::panic::AssertUnwindSafe(self.send_batch(batch, requeued))
+        let failure = match std::panic::AssertUnwindSafe(self.send_batch(batch, requeued))
             .catch_unwind()
             .await
         {
-            Ok(true) => {
+            Ok(Ok(())) => {
                 self.queue().items.drain(..length);
-                return;
+                return None;
             }
-            Ok(false) => {}
-            Err(panic) => tracing::error!(
-                "CustomLogger: async_send_batch raised; preserving {length} events in queue for retry: {}",
-                panic_message(panic.as_ref())
-            ),
-        }
+            Ok(Err(failure)) => failure,
+            Err(panic) => {
+                tracing::error!(
+                    "CustomLogger: async_send_batch raised; preserving {length} events in queue for retry: {}",
+                    panic_message(panic.as_ref())
+                );
+                None
+            }
+        };
         let max_queue_size = self.settings().max_queue_size;
         let mut queue = self.queue();
         let overflow = queue.items.len().saturating_sub(max_queue_size);
@@ -405,6 +415,7 @@ impl S3Log {
                 "CustomLogger: log queue exceeded max_queue_size={max_queue_size}; dropped {overflow} oldest events."
             );
         }
+        failure
     }
 
     fn batch_file_mode(&self) -> bool {
@@ -490,7 +501,11 @@ impl S3Log {
         outcome
     }
 
-    async fn send_batch(&self, batch: Vec<Element>, requeued_count: usize) -> bool {
+    async fn send_batch(
+        &self,
+        batch: Vec<Element>,
+        requeued_count: usize,
+    ) -> Result<(), Option<BatchUploadFailure>> {
         let uploads = if self.batch_file_mode() {
             match self.batch_files(&batch).await {
                 Ok(files) => files,
@@ -499,7 +514,7 @@ impl S3Log {
                         "CustomLogger: async_send_batch raised; preserving {} events in queue for retry: {error}",
                         batch.len()
                     );
-                    return false;
+                    return Err(None);
                 }
             }
         } else {
@@ -579,7 +594,7 @@ impl S3Log {
         let mut queue = self.queue();
         if requeued.is_empty() {
             queue.requeued = 0;
-            return true;
+            return Ok(());
         }
         let max_queue_size = self.settings().max_queue_size;
         let split = batch.len().min(queue.items.len());
@@ -597,9 +612,11 @@ impl S3Log {
             .skip(overflow)
             .collect();
         queue.requeued = requeued_length.saturating_sub(overflow);
-        self.host
-            .batch_upload_failed(batch.len(), failed.len(), uploads.len());
-        false
+        Err(Some(BatchUploadFailure {
+            queued: batch.len(),
+            failed: failed.len(),
+            total: uploads.len(),
+        }))
     }
 }
 
@@ -624,7 +641,7 @@ impl Callback for S3Log {
     }
 
     fn flush(&self) -> BoxFuture<'_, ()> {
-        Box::pin(S3Log::flush(self))
+        Box::pin(S3Log::flush(self).map(drop))
     }
 }
 

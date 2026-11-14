@@ -24,10 +24,7 @@ use crate::{
     key::{Stamp, download_name, logging_id, object_key, parent},
     limiter::Limiter,
     settings::{Environment, Granularity, Settings},
-    upload::{
-        Backoff, Body, Clock, Held, Object, Outcome, Uploader, on_host, panic_message,
-        render_bodies,
-    },
+    upload::{Backoff, Body, Clock, Held, Object, Outcome, Uploader, panic_message, render_bodies},
 };
 
 pub const NAME: &str = "s3_v2";
@@ -38,7 +35,6 @@ const PROMPTS_ONLY_NULL_KEYS: [&str; 1] = ["response"];
 pub trait Host: Send + Sync {
     fn callback_failed(&self);
     fn batch_upload_failed(&self, queued: usize, failed: usize, total: usize);
-    fn cold_storage_is_s3_v2(&self) -> bool;
     fn region_from_environment(&self) -> Result<Option<String>, String>;
     fn web_identity_token(&self, reference: &str) -> Result<String, String>;
 }
@@ -51,6 +47,7 @@ pub struct S3LogParts {
     pub clock: Clock,
     pub backoff: Backoff,
     pub host: Arc<dyn Host>,
+    pub cold_storage_is_s3_v2: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +68,7 @@ pub struct S3Log {
     uploader: Uploader,
     limiter: Limiter,
     host: Arc<dyn Host>,
+    cold_storage_is_s3_v2: bool,
     queue: Mutex<Queue>,
     flush_lock: tokio::sync::Mutex<()>,
     held: Arc<AtomicUsize>,
@@ -162,6 +160,7 @@ impl S3Log {
             },
             limiter,
             host: parts.host,
+            cold_storage_is_s3_v2: parts.cold_storage_is_s3_v2,
             queue: Mutex::default(),
             flush_lock: tokio::sync::Mutex::new(()),
             held: Arc::default(),
@@ -273,7 +272,7 @@ impl S3Log {
         })
     }
 
-    async fn event(&self, fields: &FieldValues) -> Result<Event, FieldError> {
+    fn event(&self, fields: &FieldValues) -> Result<Event, FieldError> {
         let identity = fields
             .get::<typed::LoggedKeyIdentity>()?
             .unwrap_or_default();
@@ -284,10 +283,7 @@ impl S3Log {
             MetadataKind::Mapping => cold_storage_object_key.is_some(),
             MetadataKind::Missing | MetadataKind::Null => false,
         };
-        let cold_storage_s3_v2 = reads_cold_storage
-            && on_host(&self.host, |host| host.cold_storage_is_s3_v2())
-                .await
-                .unwrap_or(false);
+        let cold_storage_s3_v2 = reads_cold_storage && self.cold_storage_is_s3_v2;
         Ok(Event {
             start: fields
                 .get::<typed::AttemptTiming>()?
@@ -307,7 +303,7 @@ impl S3Log {
         let Some(payload) = fields.payload()? else {
             return Ok(());
         };
-        let event = self.event(fields).await?;
+        let event = self.event(fields)?;
         let options = if self.log_prompts_only() {
             RenderOptions {
                 null_keys: PROMPTS_ONLY_NULL_KEYS.map(str::to_owned).to_vec(),
@@ -411,14 +407,11 @@ impl S3Log {
         }
     }
 
-    async fn batch_file_mode(&self) -> bool {
+    fn batch_file_mode(&self) -> bool {
         if !self.settings().batch_file_upload {
             return false;
         }
-        if on_host(&self.host, |host| host.cold_storage_is_s3_v2())
-            .await
-            .unwrap_or(false)
-        {
+        if self.cold_storage_is_s3_v2 {
             tracing::warn!(
                 "s3 logging: s3_batch_file_upload is ignored because s3_v2 is the cold storage logger; per-request objects are required for spend log lookups"
             );
@@ -498,7 +491,7 @@ impl S3Log {
     }
 
     async fn send_batch(&self, batch: Vec<Element>, requeued_count: usize) -> bool {
-        let uploads = if self.batch_file_mode().await {
+        let uploads = if self.batch_file_mode() {
             match self.batch_files(&batch).await {
                 Ok(files) => files,
                 Err(error) => {

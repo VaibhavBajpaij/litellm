@@ -520,8 +520,8 @@ async def test_both_loggers_skip_and_count_the_same_bad_payloads(
 async def test_a_cold_storage_key_is_reused_when_it_matches(
     golden: Golden, bucket: FakeBucket, monkeypatch: pytest.MonkeyPatch, granularity: str
 ) -> None:
-    logger = await _logger(monkeypatch, bucket, {"s3_path": "cold"})
     monkeypatch.setattr(litellm, "cold_storage_custom_logger", "s3_v2")
+    logger = await _logger(monkeypatch, bucket, {"s3_path": "cold"})
     date: Final = "2026-11-13/" if granularity == "day" else "2026-11-13/09/"
     matching: Final = f"cold/{date}time-09-05-07-000042_chatcmpl-1.json"
     for response_id, key in (("chatcmpl-1", matching), ("chatcmpl-2", "elsewhere/x.json")):
@@ -1255,8 +1255,8 @@ _NO_METADATA: Final = object()
 async def test_cold_storage_handles_odd_metadata_like_python(
     golden: Golden, bucket: FakeBucket, monkeypatch: pytest.MonkeyPatch, metadata: object, puts: int
 ) -> None:
-    logger = await _logger(monkeypatch, bucket, {})
     monkeypatch.setattr(litellm, "cold_storage_custom_logger", "s3_v2")
+    logger = await _logger(monkeypatch, bucket, {})
     payload: Final = _payload()
     if metadata is _NO_METADATA:
         del payload["metadata"]

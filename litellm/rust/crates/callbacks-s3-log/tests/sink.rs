@@ -102,10 +102,6 @@ impl Host for Recorder {
             .push((queued, failed, total));
     }
 
-    fn cold_storage_is_s3_v2(&self) -> bool {
-        false
-    }
-
     fn region_from_environment(&self) -> Result<Option<String>, String> {
         assert!(
             !self.region_panics.load(Ordering::Relaxed),
@@ -136,6 +132,15 @@ fn sink_with(
     extra: Value,
     constants: Constants,
 ) -> (Arc<S3Log>, Arc<Recorder>) {
+    sink_from(server, extra, constants, false)
+}
+
+fn sink_from(
+    server: &MockServer,
+    extra: Value,
+    constants: Constants,
+    cold_storage_is_s3_v2: bool,
+) -> (Arc<S3Log>, Arc<Recorder>) {
     let mut params = json!({
         "s3_bucket_name": "logs",
         "s3_region_name": "us-east-1",
@@ -161,6 +166,7 @@ fn sink_with(
         clock: fixed_clock,
         backoff: Arc::new(|_| Duration::ZERO),
         host: Arc::clone(&host) as Arc<dyn Host>,
+        cold_storage_is_s3_v2,
     });
     (sink, host)
 }
@@ -178,6 +184,7 @@ struct Event {
     payload: Option<PayloadRef>,
     id: &'static str,
     identity: Value,
+    cold_storage_object_key: Option<&'static str>,
 }
 
 impl Event {
@@ -190,6 +197,9 @@ impl Event {
                 Field::AttemptTiming,
                 json!({"start": {"year": 2026, "month": 11, "day": 13, "hour": 9, "minute": 5, "second": 7, "microsecond": 42}}),
             );
+        if let Some(key) = self.cold_storage_object_key {
+            fields = fields.with(Field::ColdStorageObjectKey, json!(key));
+        }
         if let Some(payload) = self.payload {
             fields.set_payload(payload);
         }
@@ -210,6 +220,7 @@ fn event_with(payload: PayloadRef, id: &'static str) -> Event {
         payload: Some(payload),
         id,
         identity: json!({"metadata_kind": "mapping", "team_alias": "team-a"}),
+        cold_storage_object_key: None,
     }
 }
 
@@ -376,6 +387,7 @@ async fn an_event_python_would_reject_is_counted_and_skipped() {
             payload: None,
             id: "b",
             identity: json!({"metadata_kind": "mapping"}),
+            cold_storage_object_key: None,
         },
     )
     .await;
@@ -626,4 +638,61 @@ async fn prompts_only_renders_the_response_as_null(#[case] extra: Value, #[case]
         server.received_requests().await.unwrap()[0].body,
         body.as_bytes()
     );
+}
+
+const HOUR_KEY: &str = "base/2026-11-13/09/time-09-05-07-000042_a.json";
+const DAY_KEY: &str = "base/2026-11-13/time-09-05-07-000042_a.json";
+
+#[rstest]
+#[case::s3_v2_reuses_its_hour_key(true, json!({"metadata_kind": "mapping"}), Some(HOUR_KEY))]
+#[case::another_owner_keeps_the_day_key(false, json!({"metadata_kind": "mapping"}), Some(DAY_KEY))]
+#[case::s3_v2_rejects_metadata_without_get(true, json!({"metadata_kind": "other"}), None)]
+#[case::another_owner_ignores_metadata_without_get(false, json!({"metadata_kind": "other"}), Some(DAY_KEY))]
+#[tokio::test]
+async fn the_constructor_cold_storage_owner_decides_the_cold_key(
+    #[case] cold_storage_is_s3_v2: bool,
+    #[case] identity: Value,
+    #[case] key: Option<&str>,
+) {
+    let server = MockServer::start().await;
+    let (sink, host) = sink_from(
+        &server,
+        json!({}),
+        Constants::default(),
+        cold_storage_is_s3_v2,
+    );
+    let mut cold = event(&host, "a", "{}");
+    cold.identity = identity;
+    cold.cold_storage_object_key = Some(HOUR_KEY);
+    submit(&sink, cold).await;
+
+    assert_eq!(sink.queued_keys(), key.into_iter().collect::<Vec<_>>());
+    assert_eq!(host.failures(), usize::from(key.is_none()));
+}
+
+#[rstest]
+#[case::s3_v2_owner(true, "/logs/base/2026-11-13/time-09-05-07-000042_a.json")]
+#[case::another_owner(false, "/logs/base/2026-11-13/batch_09-05-07_")]
+#[tokio::test]
+async fn the_constructor_cold_storage_owner_turns_batch_files_off(
+    #[case] cold_storage_is_s3_v2: bool,
+    #[case] path: &str,
+) {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let (sink, host) = sink_from(
+        &server,
+        json!({"s3_batch_file_upload": true}),
+        Constants::default(),
+        cold_storage_is_s3_v2,
+    );
+    submit(&sink, event(&host, "a", "{}")).await;
+    sink.flush().await;
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].url.path().starts_with(path));
 }

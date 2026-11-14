@@ -1316,19 +1316,41 @@ async def test_elements_appended_after_failed_batch_file_get_their_own_file(
 async def test_batch_file_mode_disabled_when_s3_v2_is_cold_storage_logger(
     monkeypatch: pytest.MonkeyPatch, bucket: ScriptedBucket
 ) -> None:
-    logger: Final = _logger(monkeypatch, bucket, s3_batch_file_upload=True)
-
     monkeypatch.setattr(litellm, "cold_storage_custom_logger", "s3_v2")
+    logger: Final = _logger(monkeypatch, bucket, s3_batch_file_upload=True)
     await _upload(logger, {"id": "req-1"})
 
     assert len(bucket.puts()) == 1
     assert bucket.puts()[0].path.endswith("_req-1.json")
 
     monkeypatch.setattr(litellm, "cold_storage_custom_logger", None)
-    await _upload(logger, {"id": "req-2"})
+    batch_logger: Final = _logger(monkeypatch, bucket, s3_batch_file_upload=True)
+    await _upload(batch_logger, {"id": "req-2"})
 
     assert len(bucket.puts()) == 2
     assert bucket.puts()[1].path.endswith(".jsonl")
+
+
+@pytest.mark.parametrize(
+    ("owner_when_built", "owner_after", "suffix"),
+    [("s3_v2", None, "_req-1.json"), (None, "s3_v2", ".jsonl")],
+)
+@pytest.mark.asyncio
+async def test_the_cold_storage_owner_is_fixed_when_the_logger_is_built(
+    monkeypatch: pytest.MonkeyPatch,
+    bucket: ScriptedBucket,
+    owner_when_built: str | None,
+    owner_after: str | None,
+    suffix: str,
+) -> None:
+    monkeypatch.setattr(litellm, "cold_storage_custom_logger", owner_when_built)
+    logger: Final = _logger(monkeypatch, bucket, s3_batch_file_upload=True)
+    monkeypatch.setattr(litellm, "cold_storage_custom_logger", owner_after)
+
+    await _upload(logger, {"id": "req-1"})
+
+    (put,) = bucket.puts()
+    assert put.path.endswith(suffix)
 
 
 def _coded_body(code: str | None, raw_body: str | None = None) -> str:

@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import os
 from collections.abc import Callable, Collection, Mapping
@@ -30,7 +31,7 @@ from litellm.integrations.custom_logger_v2.derivations import (
 )
 from litellm.integrations.custom_logger_v2.enums import Field, Hook
 from litellm.integrations.custom_logger_v2.field_sources import HookArgs
-from litellm.integrations.custom_logger_v2.logger import on
+from litellm.integrations.custom_logger_v2.logger import CustomLoggerV2, on
 from litellm.integrations.custom_logger_v2.outcomes import Abort, Patch
 from litellm.integrations.custom_logger_v2.rust import RustLogger
 from litellm.integrations.custom_logger_v2.selection import Selection
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
     from litellm.rust_bridge._native import NativeS3Log
 
 CALLBACK_NAME: Final = "s3_v2"
+STRIP_CALLBACK_NAME: Final = "s3_v2_strip_base64_files"
 _WEB_IDENTITY_TOKEN_MIN_LENGTH: Final = 4
 _DEFAULT_MAX_RETRY_AGE_SECONDS: Final = 3600
 
@@ -232,6 +234,14 @@ class _Base64Stripper(CustomLogger):
     def strip(self, payload: StandardLoggingPayload) -> None:
         _ = self._strip_base64_from_messages_sync(payload)
 
+    def stripped(self, messages: list[object]) -> list[dict[str, object]]:
+        return self._process_messages(messages=[_shallow_copy(message) for message in messages])
+
+
+def _shallow_copy(message: object) -> object:
+    entries: Final = mapping(message)
+    return copy.copy(entries) if entries is not None and isinstance(message, dict) else message
+
 
 _STRIPPER: Final = _Base64Stripper()
 
@@ -250,6 +260,35 @@ def legacy_should_log(kwargs: Mapping[str, object]) -> bool:
         litellm_params=litellm_params,
         standard_callback_dynamic_params=kwargs.get("standard_callback_dynamic_params") or {},  # pyright: ignore[reportArgumentType]  # the dynamic params dict the legacy path hands the same check
     )
+
+
+def _payload_messages(payload: Mapping[str, object]) -> list[object]:
+    raw: Final = payload.get("messages")
+    return [*raw] if isinstance(raw, list) else []
+
+
+class S3StripBase64Files(CustomLoggerV2):
+    selection = Selection(name=STRIP_CALLBACK_NAME)
+
+    def __init__(self, s3_logger_key: str) -> None:
+        self.s3_logger_key: Final = s3_logger_key
+
+    @on(
+        Hook.log_prepare,
+        reads={Field.deprecated_kwargs, Field.standard_logging_payload},
+        writes={Field.standard_logging_payload},
+    )
+    async def on_log_prepare(self, view: object, ctx: CallContext[object]) -> Patch | None:
+        from litellm.litellm_core_utils.litellm_logging import V2_ASYNC_LOGGING_LINE
+
+        kwargs: Final = mapping(getattr(view, Field.deprecated_kwargs.value, None))
+        payload: Final = mapping(getattr(view, Field.standard_logging_payload.value, None))
+        if not V2_ASYNC_LOGGING_LINE.get() or kwargs is None or payload is None or not legacy_should_log(kwargs):
+            return None
+        messages: Final = _payload_messages(payload)
+        if not messages:
+            return None
+        return Patch().merge(Field.standard_logging_payload, {"messages": _STRIPPER.stripped(messages)})
 
 
 async def _periodic_flush(sink: "NativeS3Log", interval: float) -> None:
@@ -345,6 +384,11 @@ class S3Logger(RustLogger):
             _periodic_flush(sink, _flush_interval(settings.get("s3_flush_interval", DEFAULT_S3_FLUSH_INTERVAL_SECONDS)))
         )
         super().__init__(sink.callback(), {Field.deprecated_kwargs: lambda _kwargs: None})
+        self.v2_companion: Final = (
+            S3StripBase64Files(litellm.logging_callback_manager.get_custom_logger_key(self))
+            if sink.strip_base64_files
+            else None
+        )
 
     @on(Hook.attempt_ended, reads=_ATTEMPT_ENDED_READS, awaited=True)
     async def on_attempt_ended(self, view: object, ctx: CallContext[object]) -> Patch | Abort | None:
@@ -432,5 +476,6 @@ class S3Logger(RustLogger):
 __all__ = [
     "S3BatchUploadError",
     "S3Logger",
+    "S3StripBase64Files",
     "legacy_should_log",
 ]
